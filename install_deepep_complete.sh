@@ -31,10 +31,11 @@ echo "  - python3 found: $(which python3)"
 # 2. NVSHMEM Configuration
 echo "[+] Configuring NVSHMEM..."
 if [ ! -f "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/libnvshmem_host.so" ]; then
+    current_dir=$(pwd)
     cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
     ln -s libnvshmem_host.so.3 libnvshmem_host.so
-    ls -l libnvshmem_host.so
-    # 正常应显示：libnvshmem_host.so -> libnvshmem_host.so.3
+    ls -l libnvshmem_host.so # It will show：libnvshmem_host.so -> libnvshmem_host.so.3
+    cd "$current_dir"
 fi
 
 # Try to find NVSHMEM from typical pip install location if not set
