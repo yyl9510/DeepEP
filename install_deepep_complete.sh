@@ -3,7 +3,7 @@ set -e  # Exit on error
 
 # DeepEP Installation Script
 # Assumes the current directory is the DeepEP repository root.
-# Example in B200: export TORCH_CUDA_ARCH_LIST="10.0" ./install_deepep_complete.sh
+# Example in B200: TORCH_CUDA_ARCH_LIST="10.0" bash ./install_deepep_complete.sh
 
 echo "=========================================="
 echo "Starting DeepEP Installation"
@@ -32,7 +32,7 @@ echo "  - python3 found: $(which python3)"
 echo "[+] Configuring NVSHMEM..."
 if [ ! -f "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/libnvshmem_host.so" ]; then
     cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
-    sudo ln -s libnvshmem_host.so.3 libnvshmem_host.so
+    ln -s libnvshmem_host.so.3 libnvshmem_host.so
     ls -l libnvshmem_host.so
     # 正常应显示：libnvshmem_host.so -> libnvshmem_host.so.3
 fi
