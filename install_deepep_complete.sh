@@ -30,10 +30,12 @@ echo "  - python3 found: $(which python3)"
 
 # 2. NVSHMEM Configuration
 echo "[+] Configuring NVSHMEM..."
-cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
-sudo ln -s libnvshmem_host.so.3 libnvshmem_host.so
-ls -l libnvshmem_host.so
-# 正常应显示：libnvshmem_host.so -> libnvshmem_host.so.3
+if [ ! -f "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/libnvshmem_host.so" ]; then
+    cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
+    sudo ln -s libnvshmem_host.so.3 libnvshmem_host.so
+    ls -l libnvshmem_host.so
+    # 正常应显示：libnvshmem_host.so -> libnvshmem_host.so.3
+fi
 
 # Try to find NVSHMEM from typical pip install location if not set
 if [ -z "$NVSHMEM_DIR" ]; then
@@ -101,5 +103,5 @@ pip install . --no-build-isolation -v
 echo "=========================================="
 echo "Installation Complete"
 echo "=========================================="
-echo "To verify:"
-echo "python -c 'import deep_ep; print(\"Success: deep_ep imported\")'"
+echo "Verify:"
+python -c 'import deep_ep; print("Success: deep_ep imported")'

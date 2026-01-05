@@ -18,7 +18,7 @@ echo "[1/2] Running Intranode Benchmark (8 GPUs)..."
 echo "Expected H100 Baseline: ~153 GB/s (B200 should be significantly higher)"
 echo "------------------------------------------------------------"
 # Default arguments used in the repo examples
-python3 tests/test_intranode.py --num-processes 8
+python tests/test_intranode.py --num-processes 8
 echo "------------------------------------------------------------"
 echo "[+] Intranode Benchmark Complete."
 
@@ -45,7 +45,7 @@ fi
 # Run the simulation
 # We explicitly set WORLD_SIZE=1 for safety, though script defaults to it.
 export WORLD_SIZE=1
-python3 tests/test_internode_sim.py --num-processes 8
+python tests/test_internode_sim.py --num-processes 8
 
 # Cleanup
 rm tests/test_internode_sim.py
