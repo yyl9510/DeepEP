@@ -30,6 +30,11 @@ echo "  - python3 found: $(which python3)"
 
 # 2. NVSHMEM Configuration
 echo "[+] Configuring NVSHMEM..."
+cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
+sudo ln -s libnvshmem_host.so.3 libnvshmem_host.so
+ls -l libnvshmem_host.so
+# 正常应显示：libnvshmem_host.so -> libnvshmem_host.so.3
+
 # Try to find NVSHMEM from typical pip install location if not set
 if [ -z "$NVSHMEM_DIR" ]; then
     echo "  NVSHMEM_DIR is not set. Attempting to locate installed nvidia-nvshmem packet..."
@@ -78,10 +83,23 @@ if [ -d "build" ]; then
 fi
 
 echo "  - Running pip install..."
+# export CPATH=/usr/local/cuda/include:$CPATH
+# export CPLUS_INCLUDE_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/include:$CPLUS_INCLUDE_PATH
+export TARGET_CUDA_INCLUDE=/usr/local/cuda-13.0/targets/x86_64-linux/include
+export CPATH=$TARGET_CUDA_INCLUDE:$CPATH
+export CPLUS_INCLUDE_PATH=$TARGET_CUDA_INCLUDE:$CPLUS_INCLUDE_PATH
+
+export MY_CCCL_INC=/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl
+export CPATH=$MY_CCCL_INC:$CPATH
+export CXXFLAGS="-I$MY_CCCL_INC $CXXFLAGS"
+export CFLAGS="-I$MY_CCCL_INC $CFLAGS"
+
+rm -rf build/ deep_ep.egg-info/
+
 pip install . --no-build-isolation -v
 
 echo "=========================================="
 echo "Installation Complete"
 echo "=========================================="
 echo "To verify:"
-echo "python3 -c 'import deep_ep; print(\"Success: deep_ep imported\")'"
+echo "python -c 'import deep_ep; print(\"Success: deep_ep imported\")'"
