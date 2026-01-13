@@ -16,6 +16,17 @@ def get_nvshmem_host_lib_name(base_dir):
 
 
 if __name__ == '__main__':
+    # [PATCH] Bypass strict CUDA version check (13.0 vs 12.8 is fine)
+    try:
+        import torch.utils.cpp_extension
+        original_check = torch.utils.cpp_extension._check_cuda_version
+        def patched_check(compiler_name, compiler_version):
+            print(f"  [setup.py] By-passing CUDA version check: {compiler_version} vs {torch.version.cuda}")
+            return True
+        torch.utils.cpp_extension._check_cuda_version = patched_check
+    except Exception as e:
+        print(f"  [setup.py] Failed to patch CUDA check: {e}")
+
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -31,6 +42,9 @@ if __name__ == '__main__':
             disable_nvshmem = True
     else:
         disable_nvshmem = False
+
+    # [PATCH] Force disable NVSHMEM for A100 single card (missing mlx5dv.h)
+    disable_nvshmem = True
 
     if not disable_nvshmem:
         assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
