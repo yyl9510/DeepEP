@@ -3,6 +3,7 @@ set -e  # Exit on error
 
 # DeepEP Installation Script
 # Assumes the current directory is the DeepEP repository root.
+# Requires: nvcc, python3 with torch and nvidia-nvshmem installed.
 # Example in B200: TORCH_CUDA_ARCH_LIST="10.0" bash ./install_deepep_complete.sh
 
 echo "=========================================="
@@ -12,7 +13,6 @@ echo "=========================================="
 # 1. Environment Checks
 echo "[+] Checking environment..."
 
-# Check for nvcc
 if ! command -v nvcc &> /dev/null; then
     echo "Error: nvcc not found. Please ensure CUDA Toolkit is installed and in PATH."
     echo "Try: export PATH=/usr/local/cuda/bin:\$PATH"
@@ -21,82 +21,71 @@ fi
 echo "  - nvcc found: $(which nvcc)"
 nvcc --version | grep "release"
 
-# Check for Python
 if ! command -v python3 &> /dev/null; then
     echo "Error: python3 not found."
     exit 1
 fi
 echo "  - python3 found: $(which python3)"
 
-# 2. NVSHMEM Configuration
-echo "[+] Configuring NVSHMEM..."
-if [ ! -f "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/libnvshmem_host.so" ]; then
-    current_dir=$(pwd)
-    cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/
-    ln -s libnvshmem_host.so.3 libnvshmem_host.so
-    ls -l libnvshmem_host.so # It will show：libnvshmem_host.so -> libnvshmem_host.so.3
-    cd "$current_dir"
+if ! python3 -c "import torch" 2>/dev/null; then
+    echo "Error: torch not found. Please install PyTorch first."
+    exit 1
 fi
+echo "  - torch: $(python3 -c "import torch; print(f'version={torch.__version__}, cuda={torch.version.cuda}')")"
 
-# Try to find NVSHMEM from typical pip install location if not set
-if [ -z "$NVSHMEM_DIR" ]; then
-    echo "  NVSHMEM_DIR is not set. Attempting to locate installed nvidia-nvshmem packet..."
-    # Attempt to find via python
-    NVSHMEM_PATH=$(python3 -c "import nvidia.nvshmem as n; import os; print(os.path.dirname(n.__file__))" 2>/dev/null || true)
-    
-    if [ ! -z "$NVSHMEM_PATH" ]; then
-        export NVSHMEM_DIR="$NVSHMEM_PATH"
-        echo "  - Auto-detected NVSHMEM_DIR: $NVSHMEM_DIR"
+if ! python3 -c "import nvidia.nvshmem" 2>/dev/null; then
+    echo "  - nvidia-nvshmem not found, installing..."
+    pip install nvidia-nvshmem-cu12
+fi
+NVSHMEM_LIB=$(python3 -c "import nvidia.nvshmem, os; print(os.path.join(nvidia.nvshmem.__path__[0], 'lib'))")
+echo "  - nvshmem lib: $NVSHMEM_LIB"
+# Prepend to LD_LIBRARY_PATH so pip nvshmem takes priority over system nvshmem
+# (system version may lack symbols needed by DeepEP)
+export LD_LIBRARY_PATH=$NVSHMEM_LIB:$LD_LIBRARY_PATH
+
+# Persist nvshmem LD_LIBRARY_PATH into venv activate script
+VENV_PREFIX=$(python3 -c "import sys; print(sys.prefix)")
+ACTIVATE_SCRIPT="$VENV_PREFIX/bin/activate"
+if [ -f "$ACTIVATE_SCRIPT" ]; then
+    if ! grep -q "nvshmem" "$ACTIVATE_SCRIPT"; then
+        echo "" >> "$ACTIVATE_SCRIPT"
+        echo "# Added by DeepEP installer: nvshmem lib path" >> "$ACTIVATE_SCRIPT"
+        echo "export LD_LIBRARY_PATH=$NVSHMEM_LIB:\$LD_LIBRARY_PATH" >> "$ACTIVATE_SCRIPT"
+        echo "  - Added nvshmem lib to $ACTIVATE_SCRIPT"
     else
-        echo "  - Warning: NVSHMEM not found via pip. If you need internode support, please install it:"
-        echo "    pip install nvidia-nvshmem-cu12"
-        echo "    OR export NVSHMEM_DIR=/path/to/nvshmem"
-        echo "  - Proceeding without explicit NVSHMEM_DIR (DeepEP might disable internode features)."
+        echo "  - nvshmem lib already in $ACTIVATE_SCRIPT"
     fi
-else
-    echo "  - NVSHMEM_DIR is set to: $NVSHMEM_DIR"
 fi
 
-# 3. Architecture Configuration
+# 2. Architecture Configuration
 echo "[+] Configuring CUDA Architecture..."
-# Check for B200 (sm_100) or H100 (sm_90)
-# Defaulting to 9.0 (H100) as a safe baseline for modern GPUs, but 10.0 is for Blackwell.
-# If compiling for B200, users should preferably use 10.0 or 9.0+PTX.
-
 if [ -z "$TORCH_CUDA_ARCH_LIST" ]; then
-    echo "  TORCH_CUDA_ARCH_LIST not set. Detecting..."
-    # Simple heuristic: if nvcc supports > 12.0, default to 9.0. 
-    # For B200 specifically, we recommend setting this manually to "10.0" if supported, or "9.0" strictly.
-    export TORCH_CUDA_ARCH_LIST="9.0" 
-    echo "  - Defaulted TORCH_CUDA_ARCH_LIST to '9.0' (Hopper + forward compat)."
-    echo "  - NOTE: For B200 (Blackwell), ensure you are using CUDA 12.8+ or 13.0."
+    export TORCH_CUDA_ARCH_LIST="9.0"
+    echo "  - Defaulted TORCH_CUDA_ARCH_LIST to '9.0'."
+    echo "  - NOTE: For B200 (Blackwell), set TORCH_CUDA_ARCH_LIST=10.0"
 else
     echo "  - TORCH_CUDA_ARCH_LIST is set to: $TORCH_CUDA_ARCH_LIST"
 fi
 
-# 4. Installation
-echo "[+] Installing DeepEP..."
-# Using pip install . --no-build-isolation to use the current environment's packages
-# and avoid issues with isolated build environment missing Torch.
+# 3. CUDA include paths (auto-detect via /usr/local/cuda symlink)
+echo "[+] Configuring CUDA include paths..."
+CUDA_TARGET_INCLUDE=$(find /usr/local/cuda/targets/*/include -maxdepth 0 2>/dev/null | head -1)
+if [ ! -z "$CUDA_TARGET_INCLUDE" ]; then
+    export CPATH=$CUDA_TARGET_INCLUDE:$CPATH
+    export CPLUS_INCLUDE_PATH=$CUDA_TARGET_INCLUDE:$CPLUS_INCLUDE_PATH
+    echo "  - CUDA target include: $CUDA_TARGET_INCLUDE"
 
-# Optional: Clean previous builds
-if [ -d "build" ]; then
-    echo "  - Cleaning old build artifacts..."
-    rm -rf build dist *.egg-info
+    CCCL_INC="$CUDA_TARGET_INCLUDE/cccl"
+    if [ -d "$CCCL_INC" ]; then
+        export CPATH=$CCCL_INC:$CPATH
+        export CXXFLAGS="-I$CCCL_INC $CXXFLAGS"
+        export CFLAGS="-I$CCCL_INC $CFLAGS"
+        echo "  - CCCL include: $CCCL_INC"
+    fi
 fi
 
-echo "  - Running pip install..."
-# export CPATH=/usr/local/cuda/include:$CPATH
-# export CPLUS_INCLUDE_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/include:$CPLUS_INCLUDE_PATH
-export TARGET_CUDA_INCLUDE=/usr/local/cuda-13.0/targets/x86_64-linux/include
-export CPATH=$TARGET_CUDA_INCLUDE:$CPATH
-export CPLUS_INCLUDE_PATH=$TARGET_CUDA_INCLUDE:$CPLUS_INCLUDE_PATH
-
-export MY_CCCL_INC=/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl
-export CPATH=$MY_CCCL_INC:$CPATH
-export CXXFLAGS="-I$MY_CCCL_INC $CXXFLAGS"
-export CFLAGS="-I$MY_CCCL_INC $CFLAGS"
-
+# 4. Installation
+echo "[+] Installing DeepEP..."
 rm -rf build/ deep_ep.egg-info/
 
 pip install . --no-build-isolation -v
