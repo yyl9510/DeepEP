@@ -35,7 +35,8 @@ echo "  - torch: $(python3 -c "import torch; print(f'version={torch.__version__}
 
 if ! python3 -c "import nvidia.nvshmem" 2>/dev/null; then
     echo "  - nvidia-nvshmem not found, installing..."
-    pip install nvidia-nvshmem-cu12
+    CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])")
+    pip install nvidia-nvshmem-cu${CUDA_MAJOR}
 fi
 NVSHMEM_LIB=$(python3 -c "import nvidia.nvshmem, os; print(os.path.join(nvidia.nvshmem.__path__[0], 'lib'))")
 echo "  - nvshmem lib: $NVSHMEM_LIB"
