@@ -13,7 +13,7 @@ import test_low_latency
 
 # noinspection PyShadowingNames
 def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep.Buffer,
-              group: dist.ProcessGroup):
+              group: dist.ProcessGroup, nvl_buffer_sizes: list):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
@@ -71,9 +71,9 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     group.barrier()
     time.sleep(1)
 
-    # Config
-    nvl_buffer_size = 256
-    config = deep_ep.Config(num_sms, 8, nvl_buffer_size)
+    # Config (use first nvl_buffer_size for correctness tests)
+    correctness_nvl_buffer_size = nvl_buffer_sizes[0]
+    config = deep_ep.Config(num_sms, 8, correctness_nvl_buffer_size)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -194,38 +194,50 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
+    all_dispatch_results = []  # collect (dtype, nvl_buf, nvl_chunk, bw, time) tuples
     for current_x in filter(lambda elem: elem is not None, (x_e4m3, x)):
-        best_time, best_results = 1e10, None
+        dtype_label = "FP8" if isinstance(current_x, tuple) else "BF16"
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
-        for nvl_chunk_size in tuple(range(4, 33, 2)) + (0, ):
-            if nvl_chunk_size > 0:
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
-            else:
-                # Test default config as well
-                deep_ep.Buffer.set_num_sms(num_sms)
-                config = deep_ep.Buffer.get_dispatch_config(num_ranks)
-            tune_args = {'x': current_x, 'handle': handle, 'config': config}
-            t = bench(lambda: buffer.dispatch(**tune_args))[0]  # noqa: B023
-            if t < best_time and nvl_chunk_size > 0:
-                best_time, best_results = t, (num_sms, nvl_chunk_size)
-            if local_rank == 0:
-                print(
-                    f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
-                    f'{nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us',
-                    flush=True)
-        if local_rank == 0:
+        best_time_overall, best_results_overall = 1e10, None
+        for nvl_buffer_size in nvl_buffer_sizes:
+            best_time, best_results = 1e10, None
+            for nvl_chunk_size in tuple(range(4, 33, 2)) + (0, ):
+                if nvl_chunk_size > 0 and nvl_chunk_size >= nvl_buffer_size:
+                    continue  # constraint: chunk < buffer
+                if nvl_chunk_size > 0:
+                    config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+                else:
+                    # Test default config as well
+                    deep_ep.Buffer.set_num_sms(num_sms)
+                    config = deep_ep.Buffer.get_dispatch_config(num_ranks)
+                tune_args = {'x': current_x, 'handle': handle, 'config': config}
+                t = bench(lambda: buffer.dispatch(**tune_args))[0]  # noqa: B023
+                if t < best_time and nvl_chunk_size > 0:
+                    best_time, best_results = t, (num_sms, nvl_chunk_size, nvl_buffer_size)
+                if local_rank == 0:
+                    print(
+                        f'[tuning] SMs {num_sms}, NVL buf {nvl_buffer_size}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                        f'{nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us',
+                        flush=True)
+            if best_results is not None:
+                bw = nvl_recv_bytes / 1e9 / best_time
+                all_dispatch_results.append((dtype_label, num_sms, best_results[2], best_results[1], bw, best_time))
+                if best_time < best_time_overall:
+                    best_time_overall, best_results_overall = best_time, best_results
+        if local_rank == 0 and best_results_overall is not None:
             print(
-                f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us',
+                f'[tuning] Best dispatch ({dtype_label}): SMs {best_results_overall[0]}, NVL chunk {best_results_overall[1]}, NVL buf {best_results_overall[2]}, '
+                f'{nvl_recv_bytes / 1e9 / best_time_overall:.2f} GB/s (NVL), t: {best_time_overall * 1e6:.2f} us',
                 flush=True)
             print('', flush=True)
 
         # Gather the best config from rank 0 and the first test setting
-        if best_dispatch_results is None:
-            best_dispatch_results = torch.tensor([best_results[0], best_results[1]], dtype=torch.int32, device='cuda')
+        if best_dispatch_results is None and best_results_overall is not None:
+            best_dispatch_results = torch.tensor([best_results_overall[0], best_results_overall[1], best_results_overall[2]], dtype=torch.int32, device='cuda')
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
-    dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size)
+    dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], best_dispatch_results[2])
 
     dispatch_args = {
         'x': x,
@@ -237,29 +249,43 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
 
     # Tune combine performance
-    best_time, best_results = 1e10, None
-    for nvl_chunk_size in tuple(range(1, 17, 1)) + (0, ):
-        if nvl_chunk_size > 0:
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
-        else:
-            # Test default config as well
-            deep_ep.Buffer.set_num_sms(num_sms)
-            config = deep_ep.Buffer.get_combine_config(num_ranks)
-        tune_args = {'x': recv_x, 'handle': handle, 'config': config}
-        t = bench(lambda: buffer.combine(**tune_args))[0]  # noqa: B023
-        if local_rank == 0:
-            print(
-                f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
-                f'{combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us',
-                flush=True)
-            if t < best_time and nvl_chunk_size > 0:
-                best_time, best_results = t, (num_sms, nvl_chunk_size)
+    all_combine_results = []  # collect (nvl_buf, nvl_chunk, bw, time) tuples
+    best_time_overall, best_results_overall = 1e10, None
+    for nvl_buffer_size in nvl_buffer_sizes:
+        best_time, best_results = 1e10, None
+        for nvl_chunk_size in tuple(range(1, 17, 1)) + (0, ):
+            if nvl_chunk_size > 0 and nvl_chunk_size >= nvl_buffer_size:
+                continue  # constraint: chunk < buffer
+            if nvl_chunk_size > 0:
+                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+            else:
+                # Test default config as well
+                deep_ep.Buffer.set_num_sms(num_sms)
+                config = deep_ep.Buffer.get_combine_config(num_ranks)
+            tune_args = {'x': recv_x, 'handle': handle, 'config': config}
+            t = bench(lambda: buffer.combine(**tune_args))[0]  # noqa: B023
+            if local_rank == 0:
+                print(
+                    f'[tuning] SMs {num_sms}, NVL buf {nvl_buffer_size}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                    f'{combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us',
+                    flush=True)
+                if t < best_time and nvl_chunk_size > 0:
+                    best_time, best_results = t, (num_sms, nvl_chunk_size, nvl_buffer_size)
+        if best_results is not None:
+            bw = combine_bf16_nvl_send_bytes / 1e9 / best_time
+            all_combine_results.append((num_sms, best_results[2], best_results[1], bw, best_time))
+            if best_time < best_time_overall:
+                best_time_overall, best_results_overall = best_time, best_results
 
-    if local_rank == 0:
+    if local_rank == 0 and best_results_overall is not None:
         print(
-            f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}: {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us',
+            f'[tuning] Best combine: SMs {best_results_overall[0]}, NVL chunk {best_results_overall[1]}, NVL buf {best_results_overall[2]}: '
+            f'{combine_bf16_nvl_send_bytes / 1e9 / best_time_overall:.2f} GB/s (NVL), t: {best_time_overall * 1e6:.2f} us',
             flush=True)
         print('', flush=True)
+
+    # Return per-num_sms results for summary
+    return all_dispatch_results, all_combine_results
 
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
@@ -280,10 +306,42 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             use_fabric=args.use_fabric)
     torch.manual_seed(rank)
 
-    for i in (24, ):
-        test_main(args, i, local_rank, num_ranks, rank, buffer, group)
+    all_dispatch_summary = []
+    all_combine_summary = []
+    nvl_buffer_sizes = args.nvl_buffer_size
+
+    for num_sms in args.num_sms:
+        if local_rank == 0:
+            print(f'{"=" * 60}', flush=True)
+            print(f'  Testing num_sms={num_sms}, nvl_buffer_sizes={nvl_buffer_sizes}', flush=True)
+            print(f'{"=" * 60}', flush=True)
+        dispatch_results, combine_results = test_main(args, num_sms, local_rank, num_ranks, rank, buffer, group, nvl_buffer_sizes)
+        all_dispatch_summary.extend(dispatch_results)
+        all_combine_summary.extend(combine_results)
         if local_rank == 0:
             print('', flush=True)
+
+    # Print overall summary
+    if local_rank == 0 and all_dispatch_summary:
+        print(f'{"=" * 80}', flush=True)
+        print(f'  OVERALL SUMMARY (num_tokens={args.num_tokens}, hidden={args.hidden})', flush=True)
+        print(f'{"=" * 80}', flush=True)
+
+        # Dispatch table: (dtype, num_sms, nvl_buf, nvl_chunk, bw, time)
+        print('[summary] Dispatch (sorted by per-SM efficiency):', flush=True)
+        print(f'  {"dtype":>4s}  {"SMs":>4s}  {"buf":>4s}  {"chunk":>5s}  {"BW(GB/s)":>9s}  {"time(us)":>9s}  {"per-SM":>9s}', flush=True)
+        print(f'  {"----":>4s}  {"----":>4s}  {"----":>4s}  {"-----":>5s}  {"---------":>9s}  {"---------":>9s}  {"---------":>9s}', flush=True)
+        for dtype_label, sms, nvl_buf, nvl_chunk, bw, t in sorted(all_dispatch_summary, key=lambda r: -r[4] / r[1]):
+            print(f'  {dtype_label:>4s}  {sms:4d}  {nvl_buf:4d}  {nvl_chunk:5d}  {bw:9.2f}  {t * 1e6:9.2f}  {bw / sms:9.4f}', flush=True)
+        print('', flush=True)
+
+        # Combine table: (num_sms, nvl_buf, nvl_chunk, bw, time)
+        print('[summary] Combine (sorted by per-SM efficiency):', flush=True)
+        print(f'  {"SMs":>4s}  {"buf":>4s}  {"chunk":>5s}  {"BW(GB/s)":>9s}  {"time(us)":>9s}  {"per-SM":>9s}', flush=True)
+        print(f'  {"----":>4s}  {"----":>4s}  {"-----":>5s}  {"---------":>9s}  {"---------":>9s}  {"---------":>9s}', flush=True)
+        for sms, nvl_buf, nvl_chunk, bw, t in sorted(all_combine_summary, key=lambda r: -r[3] / r[0]):
+            print(f'  {sms:4d}  {nvl_buf:4d}  {nvl_chunk:5d}  {bw:9.2f}  {t * 1e6:9.2f}  {bw / sms:9.4f}', flush=True)
+        print('', flush=True)
 
     # Test compatibility with low latency functions
     if test_ll_compatibility:
@@ -299,13 +357,32 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test intranode EP kernels')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
-    parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')
-    parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
+    parser.add_argument('--num-tokens', type=int, default=16384, help='Number of tokens (default: 16384)')
+    parser.add_argument('--hidden', type=int, default=3072, help='Hidden dimension size (default: 7168)')
     parser.add_argument('--num-topk', type=int, default=8, help='Number of top-k experts (default: 8)')
-    parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256)')
+    parser.add_argument('--num-experts', type=int, default=128, help='Number of experts (default: 128)')
+    parser.add_argument('--num-sms', type=int, nargs='+', default=[24],
+                        help='SM counts to test (must be even). Default: [24]')
+    parser.add_argument('--nvl-buffer-size', type=int, nargs='+', default=None,
+                        help='NVL buffer sizes to test. Default: auto [256, 288, 512, 720]')
+    parser.add_argument('--sweep', action='store_true',
+                        help='Sweep num_sms over full range: 8,16,20,24,32,40,48')
     parser.add_argument('--allow-mnnvl', action="store_true", help='Enable MNNVL support')
     parser.add_argument('--use-fabric', action="store_true", help='Enable fabric mode')
     args = parser.parse_args()
+
+    # Validate and resolve num_sms list
+    if args.sweep:
+        args.num_sms = [8, 16, 20, 24, 32, 40, 48]
+    for s in args.num_sms:
+        assert s % 2 == 0 and s > 0, f'num_sms must be positive and even, got {s}'
+
+    # Resolve nvl_buffer_size list
+    if args.nvl_buffer_size is None:
+        args.nvl_buffer_size = [256, 288, 512, 720]
+    for b in args.nvl_buffer_size:
+        assert b > 0, f'nvl_buffer_size must be positive, got {b}'
+    args.nvl_buffer_size = sorted(set(args.nvl_buffer_size))
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
